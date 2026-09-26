@@ -5,9 +5,10 @@
  * system (github.com/manoranjan2050/Solar-Bridge-Flin-Fution-JKBMS).
  * Polls the same /api/state endpoint the web dashboard, Android app and
  * SolarBridge-LCD use, and shows solar / grid / load / battery / pack /
- * mode readings across a MAX7219 8x32 LED dot-matrix display. 32 columns
- * only fits ~8 tiny-font characters, so each metric is two screens — a
- * label ("SOLAR"), then its value ("0551W") — each held for 5 seconds.
+ * mode readings across a MAX7219 8x32 LED dot-matrix display, each field
+ * on one screen ("S-0551W", "P1-092%", ...) held for 5 seconds. Mode is
+ * the exception — its value is too unpredictable to abbreviate, so it
+ * gets a label screen + value screen.
  *
  * Hardware: ESP8266 (NodeMCU / Wemos D1 Mini) + MAX7219 8x32 dot matrix
  * (4x cascaded 8x8 FC-16 modules), hardware SPI:
@@ -687,11 +688,14 @@ String pad4(float v) {
   return String(buf);
 }
 
-// 32 columns fits ~8 tiny-font characters (at the default spacing), not
-// enough for a label and value together — so each metric is a label
-// screen ("SOLAR") followed by its value screen ("0551W"), confirmed
-// readable on the real panel via MatrixDiagnostic tests 5/6.
-const uint8_t PAGE_COUNT = 16;
+// 32 columns fits ~8 tiny-font characters at the default spacing — not
+// enough for a full word label plus a 4-digit value ("Solar-0551W" is 11
+// chars), but a short mnemonic tag fits everything on one screen:
+// "SO-0551W" and "BAT-076%" are both exactly 8. Mode is the one
+// exception — its value ("Battery", "Line/Grid", "Power saving", ...) is
+// too unpredictable to abbreviate meaningfully, so it keeps a label
+// screen + value screen.
+const uint8_t PAGE_COUNT = 9;
 String pages[PAGE_COUNT];
 uint8_t totalPages() { return (showClockPage && timeSynced) ? PAGE_COUNT + 1 : PAGE_COUNT; }
 
@@ -704,22 +708,15 @@ String fit8(const String &s) {
 }
 
 void buildPages() {
-  pages[0] = "SOLAR";
-  pages[1] = pad4(state.pvPower) + "W";
-  pages[2] = "GRID";
-  pages[3] = pad4(state.gridPower) + "W";
-  pages[4] = "LOAD";
-  pages[5] = pad4(state.loadPower) + "W";
-  pages[6] = "LOAD%";
-  pages[7] = pad3(state.loadPercent) + "%";
-  pages[8] = "BATTERY";
-  pages[9] = pad3(state.batterySoc) + "%";
-  pages[10] = "PACK1";
-  pages[11] = pad3(state.pack1Soc) + "%";
-  pages[12] = "PACK2";
-  pages[13] = pad3(state.pack2Soc) + "%";
-  pages[14] = "MODE";
-  pages[15] = fit8(state.deviceMode);
+  pages[0] = "SO-" + pad4(state.pvPower) + "W";
+  pages[1] = "GR-" + pad4(state.gridPower) + "W";
+  pages[2] = "LD-" + pad4(state.loadPower) + "W";
+  pages[3] = "LD-" + pad3(state.loadPercent) + "%";
+  pages[4] = "BAT-" + pad3(state.batterySoc) + "%";
+  pages[5] = "P1-" + pad3(state.pack1Soc) + "%";
+  pages[6] = "P2-" + pad3(state.pack2Soc) + "%";
+  pages[7] = "MODE";
+  pages[8] = fit8(state.deviceMode);
 }
 
 // ── Setup / loop ──────────────────────────────────────────────────────────
