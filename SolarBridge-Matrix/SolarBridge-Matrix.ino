@@ -376,9 +376,13 @@ bool fetchState() {
 }
 
 // ── Build the scrolling message set from the latest state ───────────────
-String fmt1(float v) {
-  char buf[16];
-  dtostrf(v, 0, 1, buf);
+// Compact, mixed-case, zero-padded readouts — shorter strings scroll
+// across the 32-column matrix faster and read cleaner than all-caps.
+String pad3(float v) {
+  int n = (int)fabs(v);
+  if (n > 999) n = 999;
+  char buf[8];
+  snprintf(buf, sizeof(buf), "%03d", n);
   return String(buf);
 }
 
@@ -386,34 +390,13 @@ const uint8_t PAGE_COUNT = 7;
 String pages[PAGE_COUNT];
 
 void buildPages() {
-  pages[0] = "SOLAR " + String((int)state.pvPower) + "W   TODAY " + fmt1(state.pvToday) + "KWH";
-  pages[1] = "LOAD " + String((int)state.loadPower) + "W   " + String((int)state.loadPercent) + "%";
-
-  String dir = state.batteryCurrent >= 0 ? "CHG" : "DIS";
-  pages[2] = "BATTERY " + String((int)state.batterySoc) + "%   " + dir + " " + fmt1(fabs(state.batteryCurrent)) + "A";
-
-  pages[3] = "GRID " + String((int)state.gridPower) + "W   MODE " + asciiOnly(state.deviceMode);
-
-  pages[4] = "PACK1 " + String((int)state.pack1Soc) + "%   PACK2 " + String((int)state.pack2Soc) +
-             "%   TOTAL " + fmt1(state.totalRemainingAh) + "AH";
-
-  if (state.loadPower > 1.0f) {
-    float hours = (state.totalRemainingAh * state.batteryVoltage) / state.loadPower;
-    pages[5] = "BACKUP " + fmt1(hours) + "H  @" + String((int)state.loadPower) + "W";
-  } else {
-    pages[5] = "BACKUP -- (NO LOAD)";
-  }
-
-  float remainToFullAh = state.totalDesignAh - state.totalRemainingAh;
-  if (state.batteryCurrent > 0.5f && remainToFullAh > 0.1f) {
-    float hours = remainToFullAh / state.batteryCurrent;
-    float chargeWatts = state.batteryCurrent * state.batteryVoltage;
-    pages[6] = "CHARGE " + fmt1(hours) + "H  @" + String((int)chargeWatts) + "W";
-  } else if (state.batteryCurrent > 0.5f) {
-    pages[6] = "CHARGE: FULL";
-  } else {
-    pages[6] = "CHARGE: -- NOT CHARGING";
-  }
+  pages[0] = "Solar - " + pad3(state.pvPower) + "w";
+  pages[1] = "Grid - " + pad3(state.gridPower) + "w";
+  pages[2] = "Load - " + pad3(state.loadPower) + "w";
+  pages[3] = "Load - " + pad3(state.loadPercent) + "%";
+  pages[4] = "Battery " + pad3(state.batterySoc) + "%";
+  pages[5] = "P1 " + pad3(state.pack1Soc) + "% P2 " + pad3(state.pack2Soc) + "%";
+  pages[6] = "Mode: " + asciiOnly(state.deviceMode);
 }
 
 // ── Setup / loop ──────────────────────────────────────────────────────────
