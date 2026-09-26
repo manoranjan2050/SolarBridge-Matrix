@@ -37,11 +37,12 @@ Preview the layout, font and timing before flashing anything:
 ### Not sure your panel's settings? Run the diagnostic sketch first
 
 `MatrixDiagnostic/` is a small, self-contained sketch (no WiFi/API, just the matrix) that cycles
-through a column sweep, brightness fill, and both fonts at different sizes/spacings, so you can
-watch the real panel and confirm module count, wiring, and font settings *before* touching the
-main firmware. This is how the 8x32 (not 8x96) module count and the tiny font's row bit-order bug
-got nailed down for this exact board — flash it, watch, adjust `MatrixDiagnostic.ino`'s constants
-to match what you actually see, then carry those settings over to `SolarBridge-Matrix.ino`.
+through: all 4 named `HARDWARE_TYPE` options shown one after another (with an asymmetric "F"
+glyph and a top-row dot sweep, so mirrored/upside-down/correct is obvious), a column sweep,
+brightness fill, and both fonts at different sizes/spacings. Flash it, watch the real panel, and
+report back what each test looked like — that's how the 8x32 (not 8x96) module count, the tiny
+font's row bit-order bug, and the mirrored-column fix below were all nailed down for this exact
+board, without guessing blind on the main firmware.
 
 ### Alerts
 
@@ -71,7 +72,7 @@ before the board knows the real time.
 | Part | Notes |
 |---|---|
 | ESP8266 dev board | NodeMCU or Wemos D1 Mini |
-| MAX7219 8x96 dot-matrix | 12x cascaded 8x8 FC-16 modules |
+| MAX7219 8x32 dot-matrix | 4x cascaded 8x8 modules |
 
 ### Wiring (hardware SPI)
 
@@ -85,21 +86,27 @@ before the board knows the real time.
 
 CLK/DIN are the ESP8266's fixed hardware-SPI pins; CS can be (and here is) any free GPIO.
 
-If the text comes out mirrored, flipped, or garbled, your modules aren't the assumed `FC16_HW`
-type — open `SolarBridge-Matrix.ino` and change `HARDWARE_TYPE` to `MD_MAX72XX::GENERIC_HW`,
-`PAROLA_HW` or `ICSTATION_HW` (the four common cascaded-module wiring variants) and reflash.
+If the text comes out mirrored, upside-down, or garbled, run `MatrixDiagnostic/` (see above) to
+find which of the 4 named `HARDWARE_TYPE`s is closest on your panel. On this board, none of them
+is fully correct alone: `FC16_HW` has the right row/vertical orientation but mirrors columns
+left-right, `GENERIC_HW` is the opposite (rows flipped, columns correct). Rather than a 5th guess,
+`SolarBridge-Matrix.ino` keeps `FC16_HW` and cancels its column mirror in software — `drawTiny()`
+flips the final column before each pixel, and `flipParolaFrame()` does the same for Parola's own
+font rendering (used for the scrolling alert/fault messages) via `mx->transform(..., TFLR)` after
+every frame. If your panel needs a different base type, change `HARDWARE_TYPE` and drop the flip
+in both functions if it turns out you don't need it.
 
 ### ⚠️ Power it separately from USB once wired up
 
-12 cascaded 8x8 modules can pull well over 1.5A at default brightness — much more than a USB port
-reliably supplies alongside the ESP8266 itself. If the board stops responding to `esptool`/USB
-uploads at all once the matrix is wired and powered, that's very likely why: a brownout during
-boot or mid-transfer, not a code or driver problem. Confirmed repeatedly on this exact build —
-flashing failed consistently with the matrix's VCC connected (`No serial data received`,
+Even 4 cascaded 8x8 modules can pull enough current at default brightness to brown out a USB
+port shared with the ESP8266 itself. If the board stops responding to `esptool`/USB uploads at
+all once the matrix is wired and powered, that's very likely why: a brownout during boot or
+mid-transfer, not a code or driver problem. Confirmed repeatedly on this exact build — flashing
+failed consistently with the matrix's VCC connected (`No serial data received`,
 `Timed out waiting for packet header`, even mid-write `Invalid head of packet`) and succeeded
 once it was disconnected. For anything beyond a quick USB-powered bench test, run the matrix's
-VCC from a separate 5V supply (sharing GND with the ESP8266) instead of off USB, and drop
-`P.setIntensity()` in the sketch if you still see resets at full brightness.
+VCC from a separate 5V supply (sharing GND with the ESP8266) instead of off USB, and drop the
+brightness (settings page or `P.setIntensity()`) if you still see resets at full brightness.
 
 If flashing still fails with the matrix unpowered — port shows present in Device Manager but
 opening it throws `PermissionError`/`device is not functioning`, or the chip won't sync even
@@ -119,8 +126,8 @@ cd SolarBridge-Matrix
 ### 2. Wire the hardware
 
 Connect the matrix to the ESP8266 per the wiring table above. Double-check VCC is going to
-**5V**, not 3.3V — 12 cascaded modules draw far more current than a single ESP8266 3.3V regulator
-can reliably supply.
+**5V**, not 3.3V — cascaded modules draw more current than a single ESP8266 3.3V regulator can
+reliably supply.
 
 ### 3. Flash it
 
