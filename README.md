@@ -3,44 +3,64 @@
 </p>
 
 Another tiny satellite display for [Solar Bridge](https://github.com/manoranjan2050/Solar-Bridge-Flin-Fution-JKBMS) —
-an ESP8266 + MAX7219 8x32 LED dot-matrix display that polls the same `/api/state` endpoint the
+an ESP8266 + MAX7219 8x96 LED dot-matrix display that polls the same `/api/state` endpoint the
 web dashboard, [Android app](https://github.com/manoranjan2050/SolarBridgeApp) and
-[SolarBridge-LCD](https://github.com/manoranjan2050/SolarBridge-LCD) use, and scrolls live solar,
-load, battery, grid, backup-time and charge-time readings across the matrix.
+[SolarBridge-LCD](https://github.com/manoranjan2050/SolarBridge-LCD) use, and shows live solar,
+load, battery, grid and clock readings on the matrix — each field held statically for 5 seconds,
+in a tiny 3x5 font ported from [Led_Matrix_Clock](https://github.com/manoranjan2050/Led_Matrix_Clock)'s
+"Small" clock mode. Everything — WiFi, the Solar Bridge server/token, poll interval and
+clock/timezone — is configurable from a settings page served by the board itself, no reflashing
+needed.
 
 **Status: built, flashed, and confirmed showing live data.**
 
 ## What it shows
 
-7 messages, scrolling continuously in order:
+8 fields, each held on screen for 5 seconds, zero-padded, no scrolling:
 
-| Message | Example |
+| Field | Example |
 |---|---|
-| Solar | `SOLAR 1024W   TODAY 10.4KWH` |
-| Load | `LOAD 920W   24%` |
-| Battery | `BATTERY 76%   CHG 6.2A` |
-| Grid | `GRID 760W   MODE LINE/GRID` |
-| Battery packs | `PACK1 92%   PACK2 88%   TOTAL 183.7AH` |
-| Backup time | `BACKUP 9.6H  @1011W` (or `BACKUP -- (NO LOAD)`) |
-| Charge time | `CHARGE 2.1H  @740W` (or `CHARGE: FULL` / `CHARGE: -- NOT CHARGING`) |
+| Solar | `Solar-0551W` |
+| Grid | `Grid-0000W` |
+| Load (watts) | `Load-0454W` |
+| Load (percent) | `Load-024%` |
+| Battery | `Battery-076%` |
+| Battery packs | `P1-092% P2-088%` |
+| Mode | `Mode:Battery` |
+| Clock | `14:32` (once NTP has synced — see below) |
 
-Same live-calculated backup/charge time formulas as SolarBridge-LCD — see that repo's README for
-the math.
+Preview the exact layout, font and timing before flashing anything:
+[Matrix Sign Preview](https://claude.ai/artifact/UB5k91nw2EBzJxJeHkSEyR).
 
 ### Alerts
 
 The backend's alert engine (grid lost/restored, battery low, high temperature, overload, battery
-full, inverter fault cleared, ...) interrupts the scroll rotation once when a *new* alert fires —
-`WARNING: GRID POWER LOST`, `INFO: GRID POWER RESTORED`, etc — then normal rotation resumes even
-if the underlying condition is still active. A real hard inverter fault
-(`inverter_fault_status == "fault"`) takes over the scroll continuously until it clears.
+full, inverter fault cleared, ...) interrupts the rotation once when a *new* alert fires —
+scrolling `WARNING: GRID POWER LOST`, `INFO: GRID POWER RESTORED`, etc, in the normal (larger)
+font since these are full sentences — then normal rotation resumes even if the underlying
+condition is still active. A real hard inverter fault (`inverter_fault_status == "fault"`) takes
+over the scroll continuously until it clears.
+
+### Web settings page
+
+Browse to the board's IP (printed on boot in the serial log, or check your router's DHCP client
+list — hostname `solarbridge-matrix`) to change WiFi (primary + backup), the Solar Bridge
+server/token/poll interval, and the clock — timezone offset, NTP server, and whether the clock
+page shows at all — without reflashing. Saving reboots the board to apply.
+
+### Clock
+
+Syncs time via NTP (`pool.ntp.org` by default) once WiFi connects. Set your timezone as a UTC
+offset in minutes from the settings page (India/IST = `330`, UK = `0`, US Eastern = `-300`). The
+clock page only appears in the rotation once a sync has actually landed, so nothing shows `00:00`
+before the board knows the real time.
 
 ## Hardware
 
 | Part | Notes |
 |---|---|
 | ESP8266 dev board | NodeMCU or Wemos D1 Mini |
-| MAX7219 8x32 dot-matrix | 4x cascaded 8x8 FC-16 modules |
+| MAX7219 8x96 dot-matrix | 12x cascaded 8x8 FC-16 modules |
 
 ### Wiring (hardware SPI)
 
@@ -60,14 +80,21 @@ type — open `SolarBridge-Matrix.ino` and change `HARDWARE_TYPE` to `MD_MAX72XX
 
 ### ⚠️ Power it separately from USB once wired up
 
-4 cascaded 8x8 modules can pull well over 500mA at default brightness — more than a USB port
+12 cascaded 8x8 modules can pull well over 1.5A at default brightness — much more than a USB port
 reliably supplies alongside the ESP8266 itself. If the board stops responding to `esptool`/USB
-uploads entirely (`Failed to connect... No serial data received`) once the matrix is wired and
-powered, that's very likely why: a brownout during boot, not a code or driver problem. Confirmed
-on this exact build — flashing failed consistently with the matrix's VCC connected and succeeded
-immediately once it was disconnected. For anything beyond a quick USB-powered bench test, run the
-matrix's VCC from a separate 5V supply (sharing GND with the ESP8266) instead of off USB, and drop
+uploads at all once the matrix is wired and powered, that's very likely why: a brownout during
+boot or mid-transfer, not a code or driver problem. Confirmed repeatedly on this exact build —
+flashing failed consistently with the matrix's VCC connected (`No serial data received`,
+`Timed out waiting for packet header`, even mid-write `Invalid head of packet`) and succeeded
+once it was disconnected. For anything beyond a quick USB-powered bench test, run the matrix's
+VCC from a separate 5V supply (sharing GND with the ESP8266) instead of off USB, and drop
 `P.setIntensity()` in the sketch if you still see resets at full brightness.
+
+If flashing still fails with the matrix unpowered — port shows present in Device Manager but
+opening it throws `PermissionError`/`device is not functioning`, or the chip won't sync even
+right after a manual FLASH+RESET — a full physical USB replug (unplug the cable, not just retry
+the command) has cleared it every time it's come up. That symptom means the USB-serial link
+itself needs a fresh enumeration, which only a real replug forces.
 
 ## Installation
 
@@ -81,8 +108,8 @@ cd SolarBridge-Matrix
 ### 2. Wire the hardware
 
 Connect the matrix to the ESP8266 per the wiring table above. Double-check VCC is going to
-**5V**, not 3.3V — 4 cascaded modules draw more current than a single ESP8266 3.3V regulator can
-reliably supply.
+**5V**, not 3.3V — 12 cascaded modules draw far more current than a single ESP8266 3.3V regulator
+can reliably supply.
 
 ### 3. Flash it
 
@@ -136,7 +163,8 @@ router's DHCP client list — hostname `solarbridge-matrix`). Set `DEFAULT_OTA_P
 - **WiFiManager** by tzapu
 - **ArduinoJson** (>= 6.19) by Benoit Blanchon
 - **MD_MAX72XX** + **MD_Parola** by majicDesigns
-- `LittleFS` and `ESP8266HTTPClient` ship with the ESP8266 Arduino core
+- `LittleFS`, `ESP8266HTTPClient`, `ESP8266WebServer` and `ArduinoOTA` ship with the ESP8266
+  Arduino core
 
 ## A note on TLS
 
