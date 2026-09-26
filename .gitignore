@@ -1,0 +1,14 @@
+# Arduino IDE / PlatformIO build artifacts
+build/
+.pio/
+.vscode/
+*.hex
+*.bin
+*.elf
+
+# Real WiFi/server/token defaults — never commit these
+SolarBridge-Matrix/secrets.h
+
+# OS cruft
+.DS_Store
+Thumbs.db
