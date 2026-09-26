@@ -28,10 +28,89 @@
 MD_Parola P = MD_Parola(HARDWARE_TYPE, CS_PIN, MAX_DEVICES);
 MD_MAX72XX *mx;
 
-void banner(const char *name) {
+void banner(const String &name) {
   Serial.println();
   Serial.print("[TEST] ");
   Serial.println(name);
+}
+
+// ── Tiny 3x5 font (bit order fixed: bit4=top row, matches
+// Led_Matrix_Clock's puttinychar() exactly). ─────────────────────────────
+const uint8_t TINY_FONT[][3] PROGMEM = {
+  {0x00, 0x00, 0x00},
+  {0x1F, 0x14, 0x1F}, {0x1F, 0x15, 0x0A}, {0x1F, 0x11, 0x11}, {0x1F, 0x11, 0x0E},
+  {0x1F, 0x15, 0x11}, {0x1F, 0x14, 0x10}, {0x1F, 0x11, 0x17}, {0x1F, 0x04, 0x1F},
+  {0x11, 0x1F, 0x11}, {0x03, 0x01, 0x1F}, {0x1F, 0x04, 0x1B}, {0x1F, 0x01, 0x01},
+  {0x1F, 0x08, 0x1F}, {0x1F, 0x10, 0x0F}, {0x1F, 0x11, 0x1F}, {0x1F, 0x14, 0x1C},
+  {0x1C, 0x14, 0x1F}, {0x1F, 0x16, 0x1D}, {0x1D, 0x15, 0x17}, {0x10, 0x1F, 0x10},
+  {0x1F, 0x01, 0x1F}, {0x1E, 0x01, 0x1E}, {0x1F, 0x02, 0x1F}, {0x1B, 0x04, 0x1B},
+  {0x1C, 0x07, 0x1C}, {0x13, 0x15, 0x19},
+  {0x1F, 0x11, 0x1F}, {0x00, 0x00, 0x1F}, {0x17, 0x15, 0x1D}, {0x11, 0x15, 0x1F},
+  {0x1C, 0x04, 0x1F}, {0x1D, 0x15, 0x17}, {0x1F, 0x15, 0x17}, {0x10, 0x10, 0x1F},
+  {0x1F, 0x15, 0x1F}, {0x1D, 0x15, 0x1F},
+  {0x04, 0x04, 0x04}, {0x00, 0x0A, 0x00}, {0x11, 0x04, 0x11},
+};
+uint8_t tinyGlyphIndex(char c) {
+  c = toupper(c);
+  if (c == ' ') return 0;
+  if (c >= 'A' && c <= 'Z') return 1 + (c - 'A');
+  if (c >= '0' && c <= '9') return 27 + (c - '0');
+  if (c == '-') return 37;
+  if (c == ':') return 38;
+  if (c == '%') return 39;
+  return 0;
+}
+
+void drawTinyOn(MD_MAX72XX *m, const String &text, uint8_t spacing) {
+  m->clear();
+  const uint8_t glyphW = 3, step = glyphW + spacing, rowOffset = 1;
+  int totalW = text.length() * step - spacing;
+  int startCol = (MAX_DEVICES * 8 - totalW) / 2;
+  if (startCol < 0) startCol = 0;
+  for (size_t i = 0; i < text.length(); i++) {
+    uint8_t idx = tinyGlyphIndex(text[i]);
+    for (uint8_t col = 0; col < glyphW; col++) {
+      uint8_t bits = pgm_read_byte(&TINY_FONT[idx][col]);
+      for (uint8_t row = 0; row < 5; row++) {
+        if (bits & (0x10 >> row)) m->setPoint(row + rowOffset, startCol + i * step + col, true);
+      }
+    }
+  }
+  m->update();
+}
+
+// ── Test 0: try all 4 hardware types in turn, on the SAME physical panel,
+// showing an asymmetric letter ("F" — looks different mirrored, upside
+// down, or rotated) followed by a left-to-right dot sweep near the top
+// row. Whichever one shows F right-side-up (not mirrored/flipped) and the
+// dot sweeping smoothly left-to-right near the TOP is the correct type —
+// tell me its name and I'll lock it into the real firmware. ─────────────
+void testHardwareTypeSweep() {
+  const char *names[] = {"FC16_HW", "PAROLA_HW", "GENERIC_HW", "ICSTATION_HW"};
+  MD_MAX72XX::moduleType_t types[] = {
+    MD_MAX72XX::FC16_HW, MD_MAX72XX::PAROLA_HW,
+    MD_MAX72XX::GENERIC_HW, MD_MAX72XX::ICSTATION_HW
+  };
+  for (uint8_t t = 0; t < 4; t++) {
+    banner(String("0.") + (t + 1) + ": hardware type = " + names[t] + " -- letter F");
+    MD_MAX72XX testMx(types[t], CS_PIN, MAX_DEVICES);
+    testMx.begin();
+    testMx.control(MD_MAX72XX::INTENSITY, 6);
+    drawTinyOn(&testMx, "F", 1);
+    delay(3000);
+
+    banner(String("0.") + (t + 1) + ": hardware type = " + names[t] + " -- sweep near top row");
+    for (uint16_t col = 0; col < MAX_DEVICES * 8; col++) {
+      testMx.clear();
+      testMx.setPoint(1, col, true);  // near top, not center, so up/down is obvious
+      testMx.update();
+      delay(90);
+    }
+    testMx.clear();
+    testMx.update();
+    delay(400);
+  }
+  banner("0: hardware type sweep done -- normal tests follow");
 }
 
 // ── Test 1: single dot sweeping left to right across all 32 columns. ────
@@ -92,50 +171,9 @@ void testBigString() {
   }
 }
 
-// ── Tiny 3x5 font (bit order fixed: bit4=top row, matches
-// Led_Matrix_Clock's puttinychar() exactly) — same table as the main
-// firmware, kept in sync manually. ───────────────────────────────────────
-const uint8_t TINY_FONT[][3] PROGMEM = {
-  {0x00, 0x00, 0x00},
-  {0x1F, 0x14, 0x1F}, {0x1F, 0x15, 0x0A}, {0x1F, 0x11, 0x11}, {0x1F, 0x11, 0x0E},
-  {0x1F, 0x15, 0x11}, {0x1F, 0x14, 0x10}, {0x1F, 0x11, 0x17}, {0x1F, 0x04, 0x1F},
-  {0x11, 0x1F, 0x11}, {0x03, 0x01, 0x1F}, {0x1F, 0x04, 0x1B}, {0x1F, 0x01, 0x01},
-  {0x1F, 0x08, 0x1F}, {0x1F, 0x10, 0x0F}, {0x1F, 0x11, 0x1F}, {0x1F, 0x14, 0x1C},
-  {0x1C, 0x14, 0x1F}, {0x1F, 0x16, 0x1D}, {0x1D, 0x15, 0x17}, {0x10, 0x1F, 0x10},
-  {0x1F, 0x01, 0x1F}, {0x1E, 0x01, 0x1E}, {0x1F, 0x02, 0x1F}, {0x1B, 0x04, 0x1B},
-  {0x1C, 0x07, 0x1C}, {0x13, 0x15, 0x19},
-  {0x1F, 0x11, 0x1F}, {0x00, 0x00, 0x1F}, {0x17, 0x15, 0x1D}, {0x11, 0x15, 0x1F},
-  {0x1C, 0x04, 0x1F}, {0x1D, 0x15, 0x17}, {0x1F, 0x15, 0x17}, {0x10, 0x10, 0x1F},
-  {0x1F, 0x15, 0x1F}, {0x1D, 0x15, 0x1F},
-  {0x04, 0x04, 0x04}, {0x00, 0x0A, 0x00}, {0x11, 0x04, 0x11},
-};
-uint8_t tinyGlyphIndex(char c) {
-  c = toupper(c);
-  if (c == ' ') return 0;
-  if (c >= 'A' && c <= 'Z') return 1 + (c - 'A');
-  if (c >= '0' && c <= '9') return 27 + (c - '0');
-  if (c == '-') return 37;
-  if (c == ':') return 38;
-  if (c == '%') return 39;
-  return 0;
-}
-
+// Thin wrapper over drawTinyOn() for the global mx, used by the tests below.
 void drawTiny(const String &text, uint8_t spacing) {
-  mx->clear();
-  const uint8_t glyphW = 3, step = glyphW + spacing, rowOffset = 1;
-  int totalW = text.length() * step - spacing;
-  int startCol = (MAX_DEVICES * 8 - totalW) / 2;
-  if (startCol < 0) startCol = 0;
-  for (size_t i = 0; i < text.length(); i++) {
-    uint8_t idx = tinyGlyphIndex(text[i]);
-    for (uint8_t col = 0; col < glyphW; col++) {
-      uint8_t bits = pgm_read_byte(&TINY_FONT[idx][col]);
-      for (uint8_t row = 0; row < 5; row++) {
-        if (bits & (0x10 >> row)) mx->setPoint(row + rowOffset, startCol + i * step + col, true);
-      }
-    }
-  }
-  mx->update();
+  drawTinyOn(mx, text, spacing);
 }
 
 // ── Test 5: tiny font, single digits, big and obvious. ───────────────────
@@ -196,6 +234,7 @@ void setup() {
 }
 
 void loop() {
+  testHardwareTypeSweep();
   testSweep();
   testFill();
   testBigDigits();

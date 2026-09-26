@@ -45,14 +45,17 @@
 
 // ── MAX7219 matrix wiring — hardware SPI (CLK=D5/SCK, DIN=D7/MOSI are
 // fixed by the ESP8266's SPI peripheral), CS is the only pin we choose. ──
-#define HARDWARE_TYPE MD_MAX72XX::GENERIC_HW  // FC16_HW showed mirrored text on this panel
+// FC16_HW confirmed correct row (up/down) orientation on this panel, but
+// mirrors columns left-right — GENERIC_HW was the opposite (rows flipped,
+// columns correct), neither alone is right for this board. Rather than a
+// 5th guess at a named type, we keep FC16_HW and cancel the mirror
+// ourselves: flipTinyCol() below, plus mx->transform(..., TFLR) after
+// every Parola-drawn frame (see flipParolaFrame()).
+#define HARDWARE_TYPE MD_MAX72XX::FC16_HW
 #define MAX_DEVICES 4    // 8x32 = 4 cascaded 8x8 modules (confirmed via MatrixDiagnostic)
 #define CS_PIN D6
 
 MD_Parola P = MD_Parola(HARDWARE_TYPE, CS_PIN, MAX_DEVICES);
-
-// If text still comes out wrong (upside-down, scrambled) try
-// MD_MAX72XX::PAROLA_HW, ICSTATION_HW, or FC16_HW instead.
 
 // Onboard LED — lights up as soon as the board has power (active LOW).
 #define POWER_LED_PIN LED_BUILTIN
@@ -108,12 +111,22 @@ uint8_t tinyGlyphIndex(char c) {
 // this backwards (bit0=top) is what produced garbage/sparse output on the
 // panel: most glyphs aren't vertically symmetric, so a bit-reversed
 // pattern looks like near-random dots, not just a mirrored letter.
+//
+// Columns are flipped (MAX_DEVICES*8-1-col) to cancel FC16_HW's left-right
+// mirroring on this panel — confirmed via MatrixDiagnostic's hardware-type
+// sweep: FC16_HW has the correct row/vertical orientation, just mirrored
+// columns, and no single named hardware type on this board gets both
+// right. Flipping the *final* absolute column (not the glyph-internal
+// layout) mirrors the whole rendered string in one step — both the
+// glyph shapes and their left-right order — which is exactly what
+// cancels a hardware mirror.
 void drawTiny(const String &text) {
   MD_MAX72XX *mx = P.getGraphicObject();
   mx->clear();
 
   const uint8_t glyphW = 3, step = glyphW + tinySpacing;
   const uint8_t rowOffset = 1;  // centers the 5-row glyph in the 8-row panel
+  const uint16_t lastCol = MAX_DEVICES * 8 - 1;
   int totalW = text.length() * step - tinySpacing;
   int startCol = (MAX_DEVICES * 8 - totalW) / 2;
   if (startCol < 0) startCol = 0;
@@ -124,7 +137,7 @@ void drawTiny(const String &text) {
       uint8_t bits = pgm_read_byte(&TINY_FONT[idx][col]);
       for (uint8_t row = 0; row < 5; row++) {
         if (bits & (0x10 >> row)) {
-          mx->setPoint(row + rowOffset, startCol + i * step + col, true);
+          mx->setPoint(row + rowOffset, lastCol - (startCol + i * step + col), true);
         }
       }
     }
@@ -290,6 +303,17 @@ void showStatic(const String &msg) {
 void showScrolling(const String &msg) {
   Serial.printf("[MATRIX] %s\n", msg.c_str());
   P.displayText(msg.c_str(), PA_LEFT, scrollSpeedMs, 400, PA_SCROLL_LEFT, PA_SCROLL_LEFT);
+}
+
+// Parola's own font rendering goes through the same FC16_HW column
+// mapping our tiny font does, so it mirrors too — cancel it the same way,
+// by flipping the whole panel buffer immediately after each frame Parola
+// draws. Call once per P.displayAnimate() call, every time, not just when
+// it returns true (every call draws a frame during a scroll).
+void flipParolaFrame() {
+  MD_MAX72XX *mx = P.getGraphicObject();
+  mx->transform(0, MAX_DEVICES - 1, MD_MAX72XX::TFLR);
+  mx->update();
 }
 
 // ── WiFi: primary + backup network ──────────────────────────────────────
@@ -791,7 +815,9 @@ void loop() {
       }
     }
   } else {  // MODE_SCROLLING
-    if (P.displayAnimate()) {
+    bool scrollDone = P.displayAnimate();
+    flipParolaFrame();
+    if (scrollDone) {
       displayMode = MODE_ROTATION;
       drawCurrentPage();
       holdUntil = now + holdMs;
