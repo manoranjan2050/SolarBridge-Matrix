@@ -4,12 +4,15 @@
  * A tiny satellite display for the Solar Bridge inverter/BMS monitoring
  * system (github.com/manoranjan2050/Solar-Bridge-Flin-Fution-JKBMS).
  * Polls the same /api/state endpoint the web dashboard, Android app and
- * SolarBridge-LCD use, and scrolls solar / load / battery / grid / backup
- * & charge time readings across a MAX7219 8x32 LED dot-matrix display.
+ * SolarBridge-LCD use, and shows solar / grid / load / battery / pack /
+ * mode readings across a MAX7219 8x96 LED dot-matrix display, each field
+ * held on screen for 5 seconds before the next.
  *
- * Hardware: ESP8266 (NodeMCU / Wemos D1 Mini) + MAX7219 8x32 dot matrix
- * (4x cascaded 8x8 FC-16 modules), hardware SPI:
+ * Hardware: ESP8266 (NodeMCU / Wemos D1 Mini) + MAX7219 8x96 dot matrix
+ * (12x cascaded 8x8 FC-16 modules), hardware SPI:
  *   CLK -> D5 (SCK)   DIN -> D7 (MOSI)   CS -> D6
+ * Onboard LED (D4) lights up as soon as the board has power, as a simple
+ * "it's alive" indicator independent of WiFi/matrix state.
  *
  * First boot (or held-FLASH-button reset) opens a WiFi setup portal —
  * connect to it from a phone, no code changes needed. See README.md.
@@ -23,12 +26,14 @@
 #include <ESP8266HTTPClient.h>
 #include <WiFiClientSecureBearSSL.h>
 #include <WiFiManager.h>
+#include <ESP8266WebServer.h>
 #include <ArduinoJson.h>
 #include <LittleFS.h>
 #include <ArduinoOTA.h>
 #include <SPI.h>
 #include <MD_MAX72xx.h>
 #include <MD_Parola.h>
+#include <time.h>
 
 // Optional, gitignored — lets you hardcode WiFi/server/token for a fast
 // local flash without going through the captive portal each time. See
@@ -40,7 +45,7 @@
 // ── MAX7219 matrix wiring — hardware SPI (CLK=D5/SCK, DIN=D7/MOSI are
 // fixed by the ESP8266's SPI peripheral), CS is the only pin we choose. ──
 #define HARDWARE_TYPE MD_MAX72XX::FC16_HW
-#define MAX_DEVICES 4
+#define MAX_DEVICES 12   // 8x96 = 12 cascaded 8x8 modules
 #define CS_PIN D6
 
 MD_Parola P = MD_Parola(HARDWARE_TYPE, CS_PIN, MAX_DEVICES);
@@ -48,9 +53,74 @@ MD_Parola P = MD_Parola(HARDWARE_TYPE, CS_PIN, MAX_DEVICES);
 // If your text comes out mirrored/garbled, your modules aren't FC-16 —
 // try MD_MAX72XX::GENERIC_HW, PAROLA_HW or ICSTATION_HW instead.
 
-const uint8_t SCROLL_SPEED = 40;   // ms per column step — lower = faster
-const textEffect_t SCROLL_IN = PA_SCROLL_LEFT;
-const textEffect_t SCROLL_OUT = PA_SCROLL_LEFT;
+// Onboard LED — lights up as soon as the board has power (active LOW).
+#define POWER_LED_PIN LED_BUILTIN
+
+const uint8_t SCROLL_SPEED = 40;      // ms per column step — lower = faster
+const uint16_t HOLD_MS = 5000;        // each field stays on screen 5s
+
+// ── Tiny 3x5 font — ported from manoranjan2050/Led_Matrix_Clock's "Small"
+// mode (Library/FontLEDClock/FontLEDClock.h, mytinyfont). Half the height
+// of MD_Parola's built-in font, so short fields read clean without
+// crowding the panel. Drawn directly via MD_MAX72XX's low-level pixel API
+// (same technique as the library's own "Parola_Mixed" example) so it can
+// sit alongside Parola's normal scrolling text for longer alert messages.
+// 3 columns per glyph, bit0 = top row .. bit4 = row 5, in the same logical
+// row/col space P.displayText() already draws in correctly on this panel.
+const uint8_t TINY_FONT[][3] PROGMEM = {
+  {0x00, 0x00, 0x00},  // space (index 0)
+  {0x1F, 0x14, 0x1F}, {0x1F, 0x15, 0x0A}, {0x1F, 0x11, 0x11}, {0x1F, 0x11, 0x0E},
+  {0x1F, 0x15, 0x11}, {0x1F, 0x14, 0x10}, {0x1F, 0x11, 0x17}, {0x1F, 0x04, 0x1F},
+  {0x11, 0x1F, 0x11}, {0x03, 0x01, 0x1F}, {0x1F, 0x04, 0x1B}, {0x1F, 0x01, 0x01},
+  {0x1F, 0x08, 0x1F}, {0x1F, 0x10, 0x0F}, {0x1F, 0x11, 0x1F}, {0x1F, 0x14, 0x1C},
+  {0x1C, 0x14, 0x1F}, {0x1F, 0x16, 0x1D}, {0x1D, 0x15, 0x17}, {0x10, 0x1F, 0x10},
+  {0x1F, 0x01, 0x1F}, {0x1E, 0x01, 0x1E}, {0x1F, 0x02, 0x1F}, {0x1B, 0x04, 0x1B},
+  {0x1C, 0x07, 0x1C}, {0x13, 0x15, 0x19},                                          // A-Z (1-26)
+  {0x1F, 0x11, 0x1F}, {0x00, 0x00, 0x1F}, {0x17, 0x15, 0x1D}, {0x11, 0x15, 0x1F},
+  {0x1C, 0x04, 0x1F}, {0x1D, 0x15, 0x17}, {0x1F, 0x15, 0x17}, {0x10, 0x10, 0x1F},
+  {0x1F, 0x15, 0x1F}, {0x1D, 0x15, 0x1F},                                          // 0-9 (27-36)
+  {0x04, 0x04, 0x04},  // '-' (37)
+  {0x00, 0x0A, 0x00},  // ':' (38)
+  {0x11, 0x04, 0x11},  // '%' (39)
+};
+uint8_t tinyGlyphIndex(char c) {
+  c = toupper(c);
+  if (c == ' ') return 0;
+  if (c >= 'A' && c <= 'Z') return 1 + (c - 'A');
+  if (c >= '0' && c <= '9') return 27 + (c - '0');
+  if (c == '-') return 37;
+  if (c == ':') return 38;
+  if (c == '%') return 39;
+  return 0;  // unknown -> blank
+}
+
+// Draws text.c_str() in the tiny font, centered, replacing whatever P
+// (Parola) last drew — call mx->update() so it actually reaches the panel.
+void drawTiny(const String &text) {
+  MD_MAX72XX *mx = P.getGraphicObject();
+  mx->clear();
+
+  const uint8_t glyphW = 3, spacing = 1, step = glyphW + spacing;
+  const uint8_t rowOffset = 1;  // centers the 5-row glyph in the 8-row panel
+  int totalW = text.length() * step - spacing;
+  int startCol = (MAX_DEVICES * 8 - totalW) / 2;
+  if (startCol < 0) startCol = 0;
+
+  for (size_t i = 0; i < text.length(); i++) {
+    uint8_t idx = tinyGlyphIndex(text[i]);
+    for (uint8_t col = 0; col < glyphW; col++) {
+      uint8_t bits = pgm_read_byte(&TINY_FONT[idx][col]);
+      for (uint8_t row = 0; row < 5; row++) {
+        if (bits & (1 << row)) {
+          mx->setPoint(row + rowOffset, startCol + i * step + col, true);
+        }
+      }
+    }
+  }
+  mx->update();
+  Serial.printf("[MATRIX] %s\n", text.c_str());
+}
+
 
 // ── Config persisted via WiFiManager's custom parameters ───────────────
 #define CONFIG_PATH "/config.json"
@@ -88,6 +158,21 @@ char apiToken[64] = DEFAULT_API_TOKEN;
 char pollSecondsStr[4] = "5";
 uint32_t pollIntervalMs = 5000;
 
+// Runtime-configurable WiFi (via the web settings page) — starts from the
+// secrets.h/compiled defaults, but the settings page overrides and
+// persists these to LittleFS, so WiFi can be changed without reflashing.
+char wifiSsid[32]  = DEFAULT_WIFI_SSID;
+char wifiPass[64]  = DEFAULT_WIFI_PASS;
+char wifiSsid2[32] = DEFAULT_WIFI_SSID2;
+char wifiPass2[64] = DEFAULT_WIFI_PASS2;
+
+// Clock: NTP + timezone, settable from the web page. utcOffsetMinutes can
+// be negative; e.g. India (IST) is +330.
+int utcOffsetMinutes = 330;
+char ntpServer[48] = "pool.ntp.org";
+bool showClockPage = true;
+bool timeSynced = false;
+
 // ── State polled from /api/state ────────────────────────────────────────
 struct SolarState {
   bool valid = false;
@@ -124,20 +209,34 @@ void loadConfig() {
   if (!LittleFS.exists(CONFIG_PATH)) return;
   File f = LittleFS.open(CONFIG_PATH, "r");
   if (!f) return;
-  StaticJsonDocument<256> doc;
+  StaticJsonDocument<512> doc;
   if (deserializeJson(doc, f) == DeserializationError::Ok) {
     strlcpy(serverUrl, doc["server"] | serverUrl, sizeof(serverUrl));
     strlcpy(apiToken, doc["token"] | apiToken, sizeof(apiToken));
     strlcpy(pollSecondsStr, doc["poll"] | pollSecondsStr, sizeof(pollSecondsStr));
+    strlcpy(wifiSsid, doc["ssid1"] | wifiSsid, sizeof(wifiSsid));
+    strlcpy(wifiPass, doc["pass1"] | wifiPass, sizeof(wifiPass));
+    strlcpy(wifiSsid2, doc["ssid2"] | wifiSsid2, sizeof(wifiSsid2));
+    strlcpy(wifiPass2, doc["pass2"] | wifiPass2, sizeof(wifiPass2));
+    strlcpy(ntpServer, doc["ntp"] | ntpServer, sizeof(ntpServer));
+    utcOffsetMinutes = doc["tz"] | utcOffsetMinutes;
+    showClockPage = doc["clock"] | showClockPage;
   }
   f.close();
 }
 
 void saveConfig() {
-  StaticJsonDocument<256> doc;
+  StaticJsonDocument<512> doc;
   doc["server"] = serverUrl;
   doc["token"] = apiToken;
   doc["poll"] = pollSecondsStr;
+  doc["ssid1"] = wifiSsid;
+  doc["pass1"] = wifiPass;
+  doc["ssid2"] = wifiSsid2;
+  doc["pass2"] = wifiPass2;
+  doc["ntp"] = ntpServer;
+  doc["tz"] = utcOffsetMinutes;
+  doc["clock"] = showClockPage;
   File f = LittleFS.open(CONFIG_PATH, "w");
   if (!f) return;
   serializeJson(doc, f);
@@ -157,9 +256,20 @@ String asciiOnly(const String &in) {
   return out;
 }
 
-void showMessage(const String &msg) {
+// Short, fixed-width fields (Solar/Grid/Load/Battery/etc) — these always
+// fit within the 96-column display, so just print them and hold, no
+// scrolling. This is also what fixes the scroll "lag": there's no ongoing
+// animation for a blocking WiFi/HTTP call to stutter mid-motion.
+void showStatic(const String &msg) {
   Serial.printf("[MATRIX] %s\n", msg.c_str());
-  P.displayText(msg.c_str(), PA_LEFT, SCROLL_SPEED, 400, SCROLL_IN, SCROLL_OUT);
+  P.displayText(msg.c_str(), PA_CENTER, SCROLL_SPEED, HOLD_MS, PA_PRINT, PA_NO_EFFECT);
+}
+
+// Longer, unpredictable-length text (alerts, fault messages) — scroll
+// since it may not fit in 96 columns.
+void showScrolling(const String &msg) {
+  Serial.printf("[MATRIX] %s\n", msg.c_str());
+  P.displayText(msg.c_str(), PA_LEFT, SCROLL_SPEED, 400, PA_SCROLL_LEFT, PA_SCROLL_LEFT);
 }
 
 // ── WiFi: primary + backup network ──────────────────────────────────────
@@ -175,18 +285,18 @@ bool connectWiFiBlocking(const char *ssid, const char *pass, unsigned long timeo
 
 bool connectWiFi() {
   bool connected = false;
-  if (strlen(DEFAULT_WIFI_SSID) > 0) {
-    Serial.printf("[WiFi] connecting to primary '%s'...\n", DEFAULT_WIFI_SSID);
-    showMessage("WIFI: PRIMARY");
-    connected = connectWiFiBlocking(DEFAULT_WIFI_SSID, DEFAULT_WIFI_PASS, 15000);
+  if (strlen(wifiSsid) > 0) {
+    Serial.printf("[WiFi] connecting to primary '%s'...\n", wifiSsid);
+    showStatic("WIFI: PRIMARY");
+    connected = connectWiFiBlocking(wifiSsid, wifiPass, 15000);
   }
-  if (!connected && strlen(DEFAULT_WIFI_SSID2) > 0) {
-    Serial.printf("\n[WiFi] primary failed, trying backup '%s'...\n", DEFAULT_WIFI_SSID2);
-    showMessage("WIFI: BACKUP");
-    connected = connectWiFiBlocking(DEFAULT_WIFI_SSID2, DEFAULT_WIFI_PASS2, 15000);
+  if (!connected && strlen(wifiSsid2) > 0) {
+    Serial.printf("\n[WiFi] primary failed, trying backup '%s'...\n", wifiSsid2);
+    showStatic("WIFI: BACKUP");
+    connected = connectWiFiBlocking(wifiSsid2, wifiPass2, 15000);
   }
-  if (!connected && strlen(DEFAULT_WIFI_SSID) == 0 && strlen(DEFAULT_WIFI_SSID2) == 0) {
-    showMessage("CONNECTING WIFI");
+  if (!connected && strlen(wifiSsid) == 0 && strlen(wifiSsid2) == 0) {
+    showStatic("CONNECTING WIFI");
     WiFi.begin();  // last WiFi creds saved by the SDK, if any
     unsigned long start = millis();
     while (WiFi.status() != WL_CONNECTED && millis() - start < 15000) {
@@ -212,12 +322,12 @@ void retryWiFiIfNeeded() {
   lastWifiRetry = now;
 
   wifiRetrySlot = 1 - wifiRetrySlot;
-  if (wifiRetrySlot == 0 && strlen(DEFAULT_WIFI_SSID) > 0) {
-    Serial.printf("[WiFi] reconnecting to primary '%s'...\n", DEFAULT_WIFI_SSID);
-    WiFi.begin(DEFAULT_WIFI_SSID, DEFAULT_WIFI_PASS);
-  } else if (strlen(DEFAULT_WIFI_SSID2) > 0) {
-    Serial.printf("[WiFi] reconnecting to backup '%s'...\n", DEFAULT_WIFI_SSID2);
-    WiFi.begin(DEFAULT_WIFI_SSID2, DEFAULT_WIFI_PASS2);
+  if (wifiRetrySlot == 0 && strlen(wifiSsid) > 0) {
+    Serial.printf("[WiFi] reconnecting to primary '%s'...\n", wifiSsid);
+    WiFi.begin(wifiSsid, wifiPass);
+  } else if (strlen(wifiSsid2) > 0) {
+    Serial.printf("[WiFi] reconnecting to backup '%s'...\n", wifiSsid2);
+    WiFi.begin(wifiSsid2, wifiPass2);
   } else {
     WiFi.reconnect();
   }
@@ -233,7 +343,7 @@ void runWiFiPortal() {
   wm.addParameter(&p_token);
   wm.addParameter(&p_poll);
 
-  showMessage("SETUP: CONNECT TO SolarBridge-Setup");
+  showStatic("SETUP: CONNECT TO SolarBridge-Setup");
 
   wm.setConfigPortalTimeout(180);
   bool ok = wm.autoConnect("SolarBridge-Setup");
@@ -244,7 +354,7 @@ void runWiFiPortal() {
   saveConfig();
 
   if (!ok) {
-    showMessage("WIFI SETUP TIMED OUT - RETRYING");
+    showStatic("WIFI SETUP TIMED OUT - RETRYING");
     delay(3000);
     ESP.restart();
   }
@@ -257,22 +367,137 @@ void setupOTA() {
 
   ArduinoOTA.onStart([]() {
     Serial.println("[OTA] update starting");
-    showMessage("OTA UPDATE STARTING");
+    showStatic("OTA UPDATE STARTING");
   });
   ArduinoOTA.onProgress([](unsigned int done, unsigned int total) {
     Serial.printf("[OTA] progress %u%%\n", (done * 100) / total);
   });
   ArduinoOTA.onEnd([]() {
     Serial.println("[OTA] update done, rebooting");
-    showMessage("OTA DONE - REBOOTING");
+    showStatic("OTA DONE - REBOOTING");
   });
   ArduinoOTA.onError([](ota_error_t error) {
     Serial.printf("[OTA] error %u\n", error);
-    showMessage("OTA ERROR " + String((unsigned)error));
+    showStatic("OTA ERROR " + String((unsigned)error));
   });
 
   ArduinoOTA.begin();
   Serial.printf("[OTA] ready, hostname=solarbridge-matrix ip=%s\n", WiFi.localIP().toString().c_str());
+}
+
+// ── NTP clock ─────────────────────────────────────────────────────────────
+void syncTime() {
+  configTime(utcOffsetMinutes * 60, 0, ntpServer);
+  Serial.printf("[Clock] syncing via %s, UTC offset %d min\n", ntpServer, utcOffsetMinutes);
+}
+
+bool checkTimeSynced() {
+  if (timeSynced) return true;
+  if (time(nullptr) > 1700000000) {  // sane epoch => NTP has landed
+    timeSynced = true;
+    Serial.println("[Clock] time synced");
+  }
+  return timeSynced;
+}
+
+String getClockText() {
+  time_t now = time(nullptr);
+  struct tm *t = localtime(&now);
+  char buf[6];
+  snprintf(buf, sizeof(buf), "%02d:%02d", t->tm_hour, t->tm_min);
+  return String(buf);
+}
+
+// ── Web settings page — browse to the board's IP to change WiFi, the ────
+// Solar Bridge server/token, poll interval and clock/timezone without
+// reflashing. Saving always reboots so every change re-applies cleanly.
+ESP8266WebServer webServer(80);
+
+String settingsPageHtml() {
+  String h;
+  h.reserve(4096);
+  h += F("<!DOCTYPE html><html><head><meta name='viewport' content='width=device-width,initial-scale=1'>"
+         "<title>SolarBridge-Matrix Setup</title><style>"
+         "body{font-family:system-ui,sans-serif;background:#0c0b09;color:#e9e2d6;max-width:480px;"
+         "margin:0 auto;padding:20px 16px 60px}"
+         "h1{font-size:19px;margin:0 0 4px}p.sub{color:#a89c88;font-size:13px;margin:0 0 22px}"
+         "fieldset{border:1px solid #332c1f;border-radius:10px;margin-bottom:16px;padding:14px 16px}"
+         "legend{color:#ffb020;font-size:12px;letter-spacing:.06em;text-transform:uppercase;padding:0 6px}"
+         "label{display:block;font-size:12.5px;color:#a89c88;margin:10px 0 4px}"
+         "input,select{width:100%;box-sizing:border-box;background:#17140f;border:1px solid #332c1f;"
+         "color:#e9e2d6;border-radius:7px;padding:9px 10px;font-size:14px}"
+         "small{color:#7d715f;font-size:11.5px}"
+         ".row{display:flex;gap:10px}.row>div{flex:1}"
+         "button{width:100%;margin-top:18px;background:#ffb020;color:#0c0b09;border:none;"
+         "border-radius:8px;padding:13px;font-size:15px;font-weight:600}"
+         "</style></head><body><h1>SolarBridge-Matrix</h1>"
+         "<p class='sub'>Live settings — saving reboots the board to apply.</p>"
+         "<form method='POST' action='/save'>");
+
+  h += F("<fieldset><legend>WiFi</legend>"
+         "<label>Primary SSID</label><input name='ssid1' value='");
+  h += wifiSsid;
+  h += F("'><label>Primary password</label><input name='pass1' type='password' value='");
+  h += wifiPass;
+  h += F("'><label>Backup SSID (optional)</label><input name='ssid2' value='");
+  h += wifiSsid2;
+  h += F("'><label>Backup password</label><input name='pass2' type='password' value='");
+  h += wifiPass2;
+  h += F("'></fieldset>");
+
+  h += F("<fieldset><legend>Solar Bridge API</legend>"
+         "<label>Dashboard URL</label><input name='server' value='");
+  h += serverUrl;
+  h += F("'><label>Viewer API token</label><input name='token' value='");
+  h += apiToken;
+  h += F("'><label>Poll interval (seconds)</label><input name='poll' type='number' min='2' value='");
+  h += pollSecondsStr;
+  h += F("'></fieldset>");
+
+  h += F("<fieldset><legend>Clock</legend>"
+         "<label><input type='checkbox' name='clock' value='1' style='width:auto' ");
+  h += (showClockPage ? F("checked") : F(""));
+  h += F("> Show a clock page in the rotation</label>"
+         "<label>Timezone offset from UTC (minutes)</label>"
+         "<input name='tz' type='number' value='");
+  h += String(utcOffsetMinutes);
+  h += F("'><small>India (IST) = 330 &middot; UK = 0 &middot; US Eastern = -300</small>"
+         "<label>NTP server</label><input name='ntp' value='");
+  h += ntpServer;
+  h += F("'></fieldset>"
+         "<button type='submit'>Save &amp; reboot</button></form></body></html>");
+  return h;
+}
+
+void handleRoot() {
+  webServer.send(200, "text/html", settingsPageHtml());
+}
+
+void handleSave() {
+  if (webServer.hasArg("ssid1")) strlcpy(wifiSsid, webServer.arg("ssid1").c_str(), sizeof(wifiSsid));
+  if (webServer.hasArg("pass1")) strlcpy(wifiPass, webServer.arg("pass1").c_str(), sizeof(wifiPass));
+  if (webServer.hasArg("ssid2")) strlcpy(wifiSsid2, webServer.arg("ssid2").c_str(), sizeof(wifiSsid2));
+  if (webServer.hasArg("pass2")) strlcpy(wifiPass2, webServer.arg("pass2").c_str(), sizeof(wifiPass2));
+  if (webServer.hasArg("server")) strlcpy(serverUrl, webServer.arg("server").c_str(), sizeof(serverUrl));
+  if (webServer.hasArg("token")) strlcpy(apiToken, webServer.arg("token").c_str(), sizeof(apiToken));
+  if (webServer.hasArg("poll")) strlcpy(pollSecondsStr, webServer.arg("poll").c_str(), sizeof(pollSecondsStr));
+  if (webServer.hasArg("ntp")) strlcpy(ntpServer, webServer.arg("ntp").c_str(), sizeof(ntpServer));
+  if (webServer.hasArg("tz")) utcOffsetMinutes = webServer.arg("tz").toInt();
+  showClockPage = webServer.hasArg("clock");
+
+  saveConfig();
+  webServer.send(200, "text/html",
+    "<body style='font-family:sans-serif;background:#0c0b09;color:#e9e2d6;padding:40px;text-align:center'>"
+    "<h2>Saved</h2><p>Rebooting to apply&hellip;</p></body>");
+  delay(400);
+  ESP.restart();
+}
+
+void setupWebServer() {
+  webServer.on("/", HTTP_GET, handleRoot);
+  webServer.on("/save", HTTP_POST, handleSave);
+  webServer.begin();
+  Serial.printf("[Web] settings page ready at http://%s/\n", WiFi.localIP().toString().c_str());
 }
 
 // ── Fetch + parse /api/state (filtered, so memory use stays flat no ─────
@@ -375,9 +600,9 @@ bool fetchState() {
   return true;
 }
 
-// ── Build the scrolling message set from the latest state ───────────────
-// Compact, mixed-case, zero-padded readouts — shorter strings scroll
-// across the 32-column matrix faster and read cleaner than all-caps.
+// ── Build the per-field readouts from the latest state ───────────────────
+// Zero-padded, no spaces around the dash — e.g. "Grid-0000W" — each one
+// held on screen for HOLD_MS before the next.
 String pad3(float v) {
   int n = (int)fabs(v);
   if (n > 999) n = 999;
@@ -386,29 +611,51 @@ String pad3(float v) {
   return String(buf);
 }
 
+String pad4(float v) {
+  int n = (int)fabs(v);
+  if (n > 9999) n = 9999;
+  char buf[8];
+  snprintf(buf, sizeof(buf), "%04d", n);
+  return String(buf);
+}
+
 const uint8_t PAGE_COUNT = 7;
 String pages[PAGE_COUNT];
+uint8_t totalPages() { return (showClockPage && timeSynced) ? PAGE_COUNT + 1 : PAGE_COUNT; }
 
 void buildPages() {
-  pages[0] = "Solar - " + pad3(state.pvPower) + "w";
-  pages[1] = "Grid - " + pad3(state.gridPower) + "w";
-  pages[2] = "Load - " + pad3(state.loadPower) + "w";
-  pages[3] = "Load - " + pad3(state.loadPercent) + "%";
-  pages[4] = "Battery " + pad3(state.batterySoc) + "%";
-  pages[5] = "P1 " + pad3(state.pack1Soc) + "% P2 " + pad3(state.pack2Soc) + "%";
-  pages[6] = "Mode: " + asciiOnly(state.deviceMode);
+  pages[0] = "Solar-" + pad4(state.pvPower) + "W";
+  pages[1] = "Grid-" + pad4(state.gridPower) + "W";
+  pages[2] = "Load-" + pad4(state.loadPower) + "W";
+  pages[3] = "Load-" + pad3(state.loadPercent) + "%";
+  pages[4] = "Battery-" + pad3(state.batterySoc) + "%";
+  pages[5] = "P1-" + pad3(state.pack1Soc) + "% P2-" + pad3(state.pack2Soc) + "%";
+  pages[6] = "Mode:" + asciiOnly(state.deviceMode);
 }
 
 // ── Setup / loop ──────────────────────────────────────────────────────────
+// Two display modes: ROTATION draws each field statically in the tiny font
+// on its own HOLD_MS timer; SCROLLING hands the panel to Parola's normal
+// font + scroll animation for a longer alert/fault message, then hands
+// control back to ROTATION once the scroll finishes.
+enum DisplayMode { MODE_ROTATION, MODE_SCROLLING };
+DisplayMode displayMode = MODE_ROTATION;
 uint8_t currentPage = 0;
+unsigned long holdUntil = 0;
 
 void setup() {
   Serial.begin(115200);
 
+  // Onboard LED lights up as soon as the board has power — active LOW,
+  // so LOW = on. Independent of WiFi/matrix state, just a power indicator.
+  pinMode(POWER_LED_PIN, OUTPUT);
+  digitalWrite(POWER_LED_PIN, LOW);
+
   P.begin();
   P.setIntensity(4);
+  P.setCharSpacing(1);   // tight inter-character spacing = smaller-looking text
   P.displayClear();
-  showMessage("SOLAR BRIDGE");
+  showStatic("SOLAR BRIDGE");
 
   loadConfig();
   pollIntervalMs = (uint32_t)atoi(pollSecondsStr) * 1000UL;
@@ -424,36 +671,64 @@ void setup() {
   }
 
   setupOTA();
+  setupWebServer();
+  syncTime();
 
   fetchState();
   lastPoll = millis();
   buildPages();
-  showMessage(pages[0]);
+  drawTiny(pages[0]);
+  holdUntil = millis() + HOLD_MS;
 }
+
+// currentPage < PAGE_COUNT is a data field; == PAGE_COUNT is the clock.
+void drawCurrentPage() {
+  if (currentPage < PAGE_COUNT) drawTiny(pages[currentPage]);
+  else drawTiny(getClockText());
+}
+
+unsigned long lastTimeCheck = 0;
 
 void loop() {
   unsigned long now = millis();
 
   ArduinoOTA.handle();
+  webServer.handleClient();
 
   if (now - lastPoll >= pollIntervalMs) {
     lastPoll = now;
     if (fetchState()) buildPages();
   }
 
-  if (P.displayAnimate()) {
-    // A real hard inverter fault takes over the scroll continuously.
-    if (state.faultStatus == "fault") {
-      showMessage("! FAULT: " + asciiOnly(state.faultText));
-    } else if (alertPending) {
-      alertPending = false;
-      String tag = state.alertLevel == "critical" ? "CRITICAL"
-                 : state.alertLevel == "warning"  ? "WARNING"
-                                                   : "INFO";
-      showMessage(tag + ": " + asciiOnly(state.alertMessage));
-    } else {
-      currentPage = (currentPage + 1) % PAGE_COUNT;
-      showMessage(pages[currentPage]);
+  if (!timeSynced && now - lastTimeCheck >= 3000) {
+    lastTimeCheck = now;
+    checkTimeSynced();
+  }
+
+  if (displayMode == MODE_ROTATION) {
+    if (now >= holdUntil) {
+      // A real hard inverter fault takes over the scroll continuously.
+      if (state.faultStatus == "fault") {
+        displayMode = MODE_SCROLLING;
+        showScrolling("! FAULT: " + asciiOnly(state.faultText));
+      } else if (alertPending) {
+        alertPending = false;
+        String tag = state.alertLevel == "critical" ? "CRITICAL"
+                   : state.alertLevel == "warning"  ? "WARNING"
+                                                     : "INFO";
+        displayMode = MODE_SCROLLING;
+        showScrolling(tag + ": " + asciiOnly(state.alertMessage));
+      } else {
+        currentPage = (currentPage + 1) % totalPages();
+        drawCurrentPage();
+        holdUntil = now + HOLD_MS;
+      }
+    }
+  } else {  // MODE_SCROLLING
+    if (P.displayAnimate()) {
+      displayMode = MODE_ROTATION;
+      drawCurrentPage();
+      holdUntil = now + HOLD_MS;
     }
   }
 
