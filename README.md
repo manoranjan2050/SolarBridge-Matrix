@@ -58,6 +58,17 @@ If the text comes out mirrored, flipped, or garbled, your modules aren't the ass
 type — open `SolarBridge-Matrix.ino` and change `HARDWARE_TYPE` to `MD_MAX72XX::GENERIC_HW`,
 `PAROLA_HW` or `ICSTATION_HW` (the four common cascaded-module wiring variants) and reflash.
 
+### ⚠️ Power it separately from USB once wired up
+
+4 cascaded 8x8 modules can pull well over 500mA at default brightness — more than a USB port
+reliably supplies alongside the ESP8266 itself. If the board stops responding to `esptool`/USB
+uploads entirely (`Failed to connect... No serial data received`) once the matrix is wired and
+powered, that's very likely why: a brownout during boot, not a code or driver problem. Confirmed
+on this exact build — flashing failed consistently with the matrix's VCC connected and succeeded
+immediately once it was disconnected. For anything beyond a quick USB-powered bench test, run the
+matrix's VCC from a separate 5V supply (sharing GND with the ESP8266) instead of off USB, and drop
+`P.setIntensity()` in the sketch if you still see resets at full brightness.
+
 ## Installation
 
 ### 1. Get the code
