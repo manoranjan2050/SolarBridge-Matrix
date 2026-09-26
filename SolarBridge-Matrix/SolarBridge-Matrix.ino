@@ -5,11 +5,12 @@
  * system (github.com/manoranjan2050/Solar-Bridge-Flin-Fution-JKBMS).
  * Polls the same /api/state endpoint the web dashboard, Android app and
  * SolarBridge-LCD use, and shows solar / grid / load / battery / pack /
- * mode readings across a MAX7219 8x96 LED dot-matrix display, each field
- * held on screen for 5 seconds before the next.
+ * mode readings across a MAX7219 8x32 LED dot-matrix display. 32 columns
+ * only fits ~8 tiny-font characters, so each metric is two screens — a
+ * label ("SOLAR"), then its value ("0551W") — each held for 5 seconds.
  *
- * Hardware: ESP8266 (NodeMCU / Wemos D1 Mini) + MAX7219 8x96 dot matrix
- * (12x cascaded 8x8 FC-16 modules), hardware SPI:
+ * Hardware: ESP8266 (NodeMCU / Wemos D1 Mini) + MAX7219 8x32 dot matrix
+ * (4x cascaded 8x8 FC-16 modules), hardware SPI:
  *   CLK -> D5 (SCK)   DIN -> D7 (MOSI)   CS -> D6
  * Onboard LED (D4) lights up as soon as the board has power, as a simple
  * "it's alive" indicator independent of WiFi/matrix state.
@@ -44,20 +45,24 @@
 
 // ── MAX7219 matrix wiring — hardware SPI (CLK=D5/SCK, DIN=D7/MOSI are
 // fixed by the ESP8266's SPI peripheral), CS is the only pin we choose. ──
-#define HARDWARE_TYPE MD_MAX72XX::FC16_HW
-#define MAX_DEVICES 12   // 8x96 = 12 cascaded 8x8 modules
+#define HARDWARE_TYPE MD_MAX72XX::GENERIC_HW  // FC16_HW showed mirrored text on this panel
+#define MAX_DEVICES 4    // 8x32 = 4 cascaded 8x8 modules (confirmed via MatrixDiagnostic)
 #define CS_PIN D6
 
 MD_Parola P = MD_Parola(HARDWARE_TYPE, CS_PIN, MAX_DEVICES);
 
-// If your text comes out mirrored/garbled, your modules aren't FC-16 —
-// try MD_MAX72XX::GENERIC_HW, PAROLA_HW or ICSTATION_HW instead.
+// If text still comes out wrong (upside-down, scrambled) try
+// MD_MAX72XX::PAROLA_HW, ICSTATION_HW, or FC16_HW instead.
 
 // Onboard LED — lights up as soon as the board has power (active LOW).
 #define POWER_LED_PIN LED_BUILTIN
 
-const uint8_t SCROLL_SPEED = 40;      // ms per column step — lower = faster
-const uint16_t HOLD_MS = 5000;        // each field stays on screen 5s
+// Display settings — all runtime-configurable from the web settings page
+// (see setupWebServer()), persisted to LittleFS, with these as defaults.
+uint8_t displayIntensity = 4;      // brightness, 0-15
+uint16_t scrollSpeedMs = 40;       // ms per column step for scrolling text — lower = faster
+uint16_t holdMs = 5000;            // each field stays on screen this long
+uint8_t tinySpacing = 1;           // blank columns between tiny-font characters
 
 // ── Tiny 3x5 font — ported from manoranjan2050/Led_Matrix_Clock's "Small"
 // mode (Library/FontLEDClock/FontLEDClock.h, mytinyfont). Half the height
@@ -96,13 +101,20 @@ uint8_t tinyGlyphIndex(char c) {
 
 // Draws text.c_str() in the tiny font, centered, replacing whatever P
 // (Parola) last drew — call mx->update() so it actually reaches the panel.
+//
+// Bit order matches Led_Matrix_Clock's own puttinychar() exactly: row 0
+// (top) is bit 4 (the *high* bit, tested as `dots & (16 >> row)`), not
+// bit 0 — the reverse of what a first read of the byte suggests. Getting
+// this backwards (bit0=top) is what produced garbage/sparse output on the
+// panel: most glyphs aren't vertically symmetric, so a bit-reversed
+// pattern looks like near-random dots, not just a mirrored letter.
 void drawTiny(const String &text) {
   MD_MAX72XX *mx = P.getGraphicObject();
   mx->clear();
 
-  const uint8_t glyphW = 3, spacing = 1, step = glyphW + spacing;
+  const uint8_t glyphW = 3, step = glyphW + tinySpacing;
   const uint8_t rowOffset = 1;  // centers the 5-row glyph in the 8-row panel
-  int totalW = text.length() * step - spacing;
+  int totalW = text.length() * step - tinySpacing;
   int startCol = (MAX_DEVICES * 8 - totalW) / 2;
   if (startCol < 0) startCol = 0;
 
@@ -111,7 +123,7 @@ void drawTiny(const String &text) {
     for (uint8_t col = 0; col < glyphW; col++) {
       uint8_t bits = pgm_read_byte(&TINY_FONT[idx][col]);
       for (uint8_t row = 0; row < 5; row++) {
-        if (bits & (1 << row)) {
+        if (bits & (0x10 >> row)) {
           mx->setPoint(row + rowOffset, startCol + i * step + col, true);
         }
       }
@@ -221,6 +233,10 @@ void loadConfig() {
     strlcpy(ntpServer, doc["ntp"] | ntpServer, sizeof(ntpServer));
     utcOffsetMinutes = doc["tz"] | utcOffsetMinutes;
     showClockPage = doc["clock"] | showClockPage;
+    displayIntensity = doc["bright"] | displayIntensity;
+    scrollSpeedMs = doc["scrollms"] | scrollSpeedMs;
+    holdMs = doc["holdms"] | holdMs;
+    tinySpacing = doc["spacing"] | tinySpacing;
   }
   f.close();
 }
@@ -237,6 +253,10 @@ void saveConfig() {
   doc["ntp"] = ntpServer;
   doc["tz"] = utcOffsetMinutes;
   doc["clock"] = showClockPage;
+  doc["bright"] = displayIntensity;
+  doc["scrollms"] = scrollSpeedMs;
+  doc["holdms"] = holdMs;
+  doc["spacing"] = tinySpacing;
   File f = LittleFS.open(CONFIG_PATH, "w");
   if (!f) return;
   serializeJson(doc, f);
@@ -262,14 +282,14 @@ String asciiOnly(const String &in) {
 // animation for a blocking WiFi/HTTP call to stutter mid-motion.
 void showStatic(const String &msg) {
   Serial.printf("[MATRIX] %s\n", msg.c_str());
-  P.displayText(msg.c_str(), PA_CENTER, SCROLL_SPEED, HOLD_MS, PA_PRINT, PA_NO_EFFECT);
+  P.displayText(msg.c_str(), PA_CENTER, scrollSpeedMs, holdMs, PA_PRINT, PA_NO_EFFECT);
 }
 
 // Longer, unpredictable-length text (alerts, fault messages) — scroll
 // since it may not fit in 96 columns.
 void showScrolling(const String &msg) {
   Serial.printf("[MATRIX] %s\n", msg.c_str());
-  P.displayText(msg.c_str(), PA_LEFT, SCROLL_SPEED, 400, PA_SCROLL_LEFT, PA_SCROLL_LEFT);
+  P.displayText(msg.c_str(), PA_LEFT, scrollSpeedMs, 400, PA_SCROLL_LEFT, PA_SCROLL_LEFT);
 }
 
 // ── WiFi: primary + backup network ──────────────────────────────────────
@@ -464,7 +484,27 @@ String settingsPageHtml() {
   h += F("'><small>India (IST) = 330 &middot; UK = 0 &middot; US Eastern = -300</small>"
          "<label>NTP server</label><input name='ntp' value='");
   h += ntpServer;
-  h += F("'></fieldset>"
+  h += F("'></fieldset>");
+
+  h += F("<fieldset><legend>Display</legend>"
+         "<label>Brightness (0-15)</label>"
+         "<input name='bright' type='number' min='0' max='15' value='");
+  h += String(displayIntensity);
+  h += F("'><div class='row'><div><label>Field hold time (seconds)</label>"
+         "<input name='holds' type='number' min='1' step='0.5' value='");
+  h += String(holdMs / 1000.0, 1);
+  h += F("'></div><div><label>Alert scroll speed (ms/step)</label>"
+         "<input name='scroll' type='number' min='10' max='200' value='");
+  h += String(scrollSpeedMs);
+  h += F("'></div></div>"
+         "<small>Lower scroll speed = faster. Applies to the longer scrolling "
+         "alert/fault messages, not the static fields.</small>"
+         "<label>Tiny-font character spacing (columns)</label>"
+         "<input name='spacing' type='number' min='0' max='4' value='");
+  h += String(tinySpacing);
+  h += F("'><small>Blank columns between characters in the field rotation — 0 is "
+         "tightest/smallest-looking, higher spreads letters out more.</small>"
+         "</fieldset>"
          "<button type='submit'>Save &amp; reboot</button></form></body></html>");
   return h;
 }
@@ -484,6 +524,10 @@ void handleSave() {
   if (webServer.hasArg("ntp")) strlcpy(ntpServer, webServer.arg("ntp").c_str(), sizeof(ntpServer));
   if (webServer.hasArg("tz")) utcOffsetMinutes = webServer.arg("tz").toInt();
   showClockPage = webServer.hasArg("clock");
+  if (webServer.hasArg("bright")) displayIntensity = constrain(webServer.arg("bright").toInt(), 0, 15);
+  if (webServer.hasArg("holds")) holdMs = (uint16_t)(webServer.arg("holds").toFloat() * 1000);
+  if (webServer.hasArg("scroll")) scrollSpeedMs = constrain(webServer.arg("scroll").toInt(), 10, 200);
+  if (webServer.hasArg("spacing")) tinySpacing = constrain(webServer.arg("spacing").toInt(), 0, 4);
 
   saveConfig();
   webServer.send(200, "text/html",
@@ -619,18 +663,39 @@ String pad4(float v) {
   return String(buf);
 }
 
-const uint8_t PAGE_COUNT = 7;
+// 32 columns fits ~8 tiny-font characters (at the default spacing), not
+// enough for a label and value together — so each metric is a label
+// screen ("SOLAR") followed by its value screen ("0551W"), confirmed
+// readable on the real panel via MatrixDiagnostic tests 5/6.
+const uint8_t PAGE_COUNT = 16;
 String pages[PAGE_COUNT];
 uint8_t totalPages() { return (showClockPage && timeSynced) ? PAGE_COUNT + 1 : PAGE_COUNT; }
 
+// Truncates to fit an 8-char tiny-font screen (mode names like "Line/Grid"
+// or "Power saving" would otherwise run off the 32-column panel).
+String fit8(const String &s) {
+  String out = asciiOnly(s);
+  if (out.length() > 8) out = out.substring(0, 8);
+  return out;
+}
+
 void buildPages() {
-  pages[0] = "Solar-" + pad4(state.pvPower) + "W";
-  pages[1] = "Grid-" + pad4(state.gridPower) + "W";
-  pages[2] = "Load-" + pad4(state.loadPower) + "W";
-  pages[3] = "Load-" + pad3(state.loadPercent) + "%";
-  pages[4] = "Battery-" + pad3(state.batterySoc) + "%";
-  pages[5] = "P1-" + pad3(state.pack1Soc) + "% P2-" + pad3(state.pack2Soc) + "%";
-  pages[6] = "Mode:" + asciiOnly(state.deviceMode);
+  pages[0] = "SOLAR";
+  pages[1] = pad4(state.pvPower) + "W";
+  pages[2] = "GRID";
+  pages[3] = pad4(state.gridPower) + "W";
+  pages[4] = "LOAD";
+  pages[5] = pad4(state.loadPower) + "W";
+  pages[6] = "LOAD%";
+  pages[7] = pad3(state.loadPercent) + "%";
+  pages[8] = "BATTERY";
+  pages[9] = pad3(state.batterySoc) + "%";
+  pages[10] = "PACK1";
+  pages[11] = pad3(state.pack1Soc) + "%";
+  pages[12] = "PACK2";
+  pages[13] = pad3(state.pack2Soc) + "%";
+  pages[14] = "MODE";
+  pages[15] = fit8(state.deviceMode);
 }
 
 // ── Setup / loop ──────────────────────────────────────────────────────────
@@ -651,13 +716,14 @@ void setup() {
   pinMode(POWER_LED_PIN, OUTPUT);
   digitalWrite(POWER_LED_PIN, LOW);
 
+  loadConfig();
+
   P.begin();
-  P.setIntensity(4);
-  P.setCharSpacing(1);   // tight inter-character spacing = smaller-looking text
+  P.setIntensity(displayIntensity);
+  P.setCharSpacing(1);   // spacing for the normal font (boot/WiFi/OTA messages, alerts)
   P.displayClear();
   showStatic("SOLAR BRIDGE");
 
-  loadConfig();
   pollIntervalMs = (uint32_t)atoi(pollSecondsStr) * 1000UL;
   if (pollIntervalMs < 2000) pollIntervalMs = 5000;
 
@@ -678,7 +744,7 @@ void setup() {
   lastPoll = millis();
   buildPages();
   drawTiny(pages[0]);
-  holdUntil = millis() + HOLD_MS;
+  holdUntil = millis() + holdMs;
 }
 
 // currentPage < PAGE_COUNT is a data field; == PAGE_COUNT is the clock.
@@ -721,14 +787,14 @@ void loop() {
       } else {
         currentPage = (currentPage + 1) % totalPages();
         drawCurrentPage();
-        holdUntil = now + HOLD_MS;
+        holdUntil = now + holdMs;
       }
     }
   } else {  // MODE_SCROLLING
     if (P.displayAnimate()) {
       displayMode = MODE_ROTATION;
       drawCurrentPage();
-      holdUntil = now + HOLD_MS;
+      holdUntil = now + holdMs;
     }
   }
 

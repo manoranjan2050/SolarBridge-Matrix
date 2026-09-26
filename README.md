@@ -3,34 +3,45 @@
 </p>
 
 Another tiny satellite display for [Solar Bridge](https://github.com/manoranjan2050/Solar-Bridge-Flin-Fution-JKBMS) —
-an ESP8266 + MAX7219 8x96 LED dot-matrix display that polls the same `/api/state` endpoint the
+an ESP8266 + MAX7219 8x32 LED dot-matrix display that polls the same `/api/state` endpoint the
 web dashboard, [Android app](https://github.com/manoranjan2050/SolarBridgeApp) and
 [SolarBridge-LCD](https://github.com/manoranjan2050/SolarBridge-LCD) use, and shows live solar,
-load, battery, grid and clock readings on the matrix — each field held statically for 5 seconds,
-in a tiny 3x5 font ported from [Led_Matrix_Clock](https://github.com/manoranjan2050/Led_Matrix_Clock)'s
-"Small" clock mode. Everything — WiFi, the Solar Bridge server/token, poll interval and
-clock/timezone — is configurable from a settings page served by the board itself, no reflashing
-needed.
+load, battery, grid and clock readings on the matrix in a tiny 3x5 font ported from
+[Led_Matrix_Clock](https://github.com/manoranjan2050/Led_Matrix_Clock)'s "Small" clock mode.
+Everything — WiFi, the Solar Bridge server/token, poll interval, clock/timezone, and display
+brightness/spacing/timing — is configurable from a settings page served by the board itself, no
+reflashing needed.
 
-**Status: built, flashed, and confirmed showing live data.**
+**Status: built, flashed, and confirmed showing live data with the correct 8x32 hardware.**
 
 ## What it shows
 
-8 fields, each held on screen for 5 seconds, zero-padded, no scrolling:
+32 columns only fits about 8 tiny-font characters, so each metric is a label screen followed by
+its value screen, each held for 5 seconds:
 
-| Field | Example |
+| Label | Value |
 |---|---|
-| Solar | `Solar-0551W` |
-| Grid | `Grid-0000W` |
-| Load (watts) | `Load-0454W` |
-| Load (percent) | `Load-024%` |
-| Battery | `Battery-076%` |
-| Battery packs | `P1-092% P2-088%` |
-| Mode | `Mode:Battery` |
-| Clock | `14:32` (once NTP has synced — see below) |
+| `SOLAR` | `0551W` |
+| `GRID` | `0000W` |
+| `LOAD` | `0454W` |
+| `LOAD%` | `024%` |
+| `BATTERY` | `076%` |
+| `PACK1` | `092%` |
+| `PACK2` | `088%` |
+| `MODE` | `Battery` |
+| — | `14:32` (clock, once NTP has synced — see below) |
 
-Preview the exact layout, font and timing before flashing anything:
+Preview the layout, font and timing before flashing anything:
 [Matrix Sign Preview](https://claude.ai/artifact/UB5k91nw2EBzJxJeHkSEyR).
+
+### Not sure your panel's settings? Run the diagnostic sketch first
+
+`MatrixDiagnostic/` is a small, self-contained sketch (no WiFi/API, just the matrix) that cycles
+through a column sweep, brightness fill, and both fonts at different sizes/spacings, so you can
+watch the real panel and confirm module count, wiring, and font settings *before* touching the
+main firmware. This is how the 8x32 (not 8x96) module count and the tiny font's row bit-order bug
+got nailed down for this exact board — flash it, watch, adjust `MatrixDiagnostic.ino`'s constants
+to match what you actually see, then carry those settings over to `SolarBridge-Matrix.ino`.
 
 ### Alerts
 
